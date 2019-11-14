@@ -281,44 +281,35 @@ def model2_feature_matrix(raw_data):
 
 def model2_fit_params(raw_data):
     feat_mat = model2_feature_matrix(raw_data)
+
+    t = feat_mat[:,2]
+    phi = feat_mat[:,0]
+    psi = feat_mat[:,1]
     
     lam_en = lambdify([t_n, phi_n, psi_n, u, v], e_n)
     
-    def squared_error(u_v, arr):
+    def squared_error(u_v):
         u, v = u_v
-        t = feat_mat[:,2]
-        phi = feat_mat[:,0]
-        psi = feat_mat[:,1]
         return np.average(lam_en(t, phi, psi, u, v))
 
     jac_lambdas = [lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1)) for var1 in [u, v]]
     
-    def squared_err_jac(u_v, arr):
+    def squared_err_jac(u_v):
         u, v = u_v
-        t = feat_mat[:,2]
-        phi = feat_mat[:,0]
-        psi = feat_mat[:,1]
         return np.array([np.average(l(t, phi, psi, u, v)) for l in jac_lambdas])
 
     hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]
         
-    def squared_err_hess(u_v, arr):
-        arr.append(u_v)
+    def squared_err_hess(u_v):
         u, v = u_v
-        t = feat_mat[:,2]
-        phi = feat_mat[:,0]
-        psi = feat_mat[:,1]
         return np.array([[np.average(l(t, phi, psi, u, v)) for l in row] for row in hess_lambdas])
 
-    def squared_err_hessp(u_v, p, arr):
+    def squared_err_hessp(u_v, p):
         hess = np.matrix(squared_err_hess(u_v))
         return np.matmul(hess, p)
 
-    called_at = []
-
     opt_res = opt.minimize(
-        squared_error, (0.01, 0.01),
-        args=called_at, 
+        squared_error, (0.01, 0.01), 
         bounds = ((0, 1), (0, 1)),
         method='trust-exact', 
         jac=squared_err_jac, 
