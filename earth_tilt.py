@@ -287,19 +287,16 @@ def model2_fit_params(raw_data):
     psi = feat_mat[:,1]
     
     lam_en = lambdify([t_n, phi_n, psi_n, u, v], e_n)
-    
     def squared_error(u_v):
         u, v = u_v
         return np.average(lam_en(t, phi, psi, u, v))
 
     jac_lambdas = [lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1)) for var1 in [u, v]]
-    
     def squared_err_jac(u_v):
         u, v = u_v
         return np.array([np.average(l(t, phi, psi, u, v)) for l in jac_lambdas])
 
-    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]
-        
+    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]    
     def squared_err_hess(u_v):
         u, v = u_v
         return np.array([[np.average(l(t, phi, psi, u, v)) for l in row] for row in hess_lambdas])
@@ -309,7 +306,7 @@ def model2_fit_params(raw_data):
         return np.matmul(hess, p)
 
     opt_res = opt.minimize(
-        squared_error, (0.01, 0.01), 
+        squared_error, (0.0, 0.0), 
         bounds = ((0, 1), (0, 1)),
         method='trust-exact', 
         jac=squared_err_jac, 
@@ -342,15 +339,12 @@ def plot_model2_rms(raw_data, model2_optres):
         C2 += Rn
     C2 = (C2 / N) ** 0.5
 
-    #np.min(C2) ## 0.0075471132393685435 - a much better fit, but we may be overfitting.
     fig, (ax0) = plt.subplots(nrows=1)
     im = ax0.contourf(us, vs, C2, 50)
     fig.colorbar(im, ax=ax0)
     ax0.set_title('Model 2 RMSE')
     ax0.xaxis.set_label_text('u (a.k.a sin(alpha))')
     ax0.yaxis.set_label_text('v (a.k.a sin(eps))')
-    #ca = np.array(called_at)
-    #ax0.plot(ca[:,0], ca[:,1], marker='x', color='w', linestyle='-.')
     ax0.plot([u_opt], [v_opt], marker='+', color='r', label="Best fit")
     ax0.plot(np.full(len(vs), np.sin(real_tilt)), vs, color='w', linestyle='--', label="True alpha")
     ax0.legend()
@@ -370,6 +364,217 @@ def model2_daylight_predictions(raw_data, u_opt, v_opt):
 rms_test_error(model2_daylight_predictions(raw_test_data, u_opt, v_opt), daylight_durations(raw_test_data)) ## 234.5997870975872 s, so about 4 minutes
     
     
+#### Bayesian modeling
+
+## Laplace approximation
+
+import utils.scipy_bayes as scp_bayes
+
+sigma, x_1 = sy.symbols('sigma x_1')
+
+u_bounds = (0, 1)
+sigma_bounds = (1e-4, 1)
+
+lp1_n = - sy.ln(sigma) - 0.5 * np.log(2 * np.pi) - (((t_n  - u * x_1) / sigma)**2) / 2
+lp1_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + sy.ln(1 / sigma) - np.log(np.log(sigma_bounds[1]) - np.log(sigma_bounds[0]))
+
+ # ln(sigma) has a uniform prior on some interval
+
+def find_model1_map(raw_data):
+    mat = model1_design_matrix(raw_data)
+    t = mat[:,-1]
+    x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
+    
+    return scp_bayes.find_map(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], [0.0, 0.1], (u_bounds, sigma_bounds))
+
+m1_map = find_model1_map(raw_training_data)
+m1_alpha_99 = [np.arcsin(u) * 180 / np.pi for u in scp_bayes.laplace_99_confidence_interval(m1_map, 0)]
+m1_sigma_99 = scp_bayes.laplace_99_confidence_interval(m1_map, 1)
+m1_lapl_logev = scp_bayes.laplace_log_evidence(m1_map)
+
+lp1_n = - sy.ln(sigma) - 0.5 * np.log(2 * np.pi) - (((t_n  - u * x_1) / sigma)**2) / 2
+lp1_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + sy.ln(1 / sigma) - np.log(np.log(sigma_bounds[1]) - np.log(sigma_bounds[0]))
+
+v_bounds = (0, 1)
+
+lp2_n = - sy.ln(sigma) - 0.5 * np.log(2 * np.pi) - (((t_n - p_n) / sigma)**2) / 2
+lp2_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + np.log(1 / (v_bounds[1] - v_bounds[0])) + sy.ln(1 / sigma) - np.log(np.log(sigma_bounds[1]) - np.log(sigma_bounds[0]))
+
+def find_model2_map(raw_data):
+    feat_mat = model2_feature_matrix(raw_data)
+    
+    t = feat_mat[:,2]
+    phi = feat_mat[:,0]
+    psi = feat_mat[:,1]
+    
+    theta0 = (0.0, 0.0, 0.1)
+    theta_bounds = (u_bounds, v_bounds, sigma_bounds)
+    
+    return scp_bayes.find_map(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], theta0, theta_bounds)
+
+m2_map = find_model2_map(raw_training_data)
+m2_alpha_99 = [np.arcsin(u) * 180 / np.pi for u in scp_bayes.laplace_99_confidence_interval(m2_map, 0)]
+m2_eps_99 = [np.arcsin(v) * 180 / np.pi for v in scp_bayes.laplace_99_confidence_interval(m2_map, 1)]
+m2_sigma_99 = scp_bayes.laplace_99_confidence_interval(m2_map, 2)
+m2_lapl_logev = scp_bayes.laplace_log_evidence(m2_map)
+
+print("By the Laplace approximation, there is {} times more evidence for Model 2 than for Model 1".format(np.exp(m2_lapl_logev - m1_lapl_logev)))
+
+
+## Numerical integration
+
+import scipy.integrate as intgr
+
+def integrate_model1_logevidence(raw_data):
+    mat = model1_design_matrix(raw_data)
+    t = mat[:,-1]
+    x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
+    
+    theta0 = [0.0, 0.1]
+    theta_bounds = (u_bounds, sigma_bounds)
+    
+    return scp_bayes.integrate_evidence(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], theta0, theta_bounds)
+                
+m1_logev, m1_logev_err = integrate_model1_logevidence(raw_training_data)    
+
+def integrate_model2_logevidence(raw_data):
+    feat_mat = model2_feature_matrix(raw_data)
+    
+    t = feat_mat[:,2]
+    phi = feat_mat[:,0]
+    psi = feat_mat[:,1]
+    
+    theta0 = (0.0, 0.0, 0.1)
+    theta_bounds = (u_bounds, v_bounds, sigma_bounds)
+    
+    return scp_bayes.integrate_evidence(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], theta0, theta_bounds)
+
+#m2_logev, m2_logeverr = integrate_model2_logevidence(raw_training_data) ## NOTE slow to  compute (~ 1 minute)
+m2_logev, m2_logeverr = (530.719659036507, 529.3534395685714) # we've got a high relative error (25%), but low enough that we can be condident Model 2 has overwhelmingly more evidence than Model 1.
+
+print("By numerical integration, there is {} times more evidence for Model 2 than for Model 1".format(np.exp(m2_logev - m1_logev)))
+
+
+def plot_posterior(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds, plotted_i):
+    """.
+    """
+    map_optres = scp_bayes.find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds)
+    
+    cov = linalg.inv(map_optres.hess)
+    std_dev = np.sqrt(cov[plotted_i,plotted_i])
+    mode = map_optres.x[plotted_i]
+    radius = 5 * std_dev
+    xs = np.linspace(mode - radius, mode + radius, 100)
+    ## Laplace Approximation
+    ys_lpl = np.array([np.exp(-0.5 * ((x - mode) / std_dev) ** 2) for x in xs])
+    ys_lpl = ys_lpl / np.sum(ys_lpl)
+    plt.plot(
+            xs,
+            ys_lpl,
+            '',
+            label="Laplace Approximation")
+    
+    all_syms = [] + list(data_syms) + list(theta_syms)
+    lam_f_n = lambdify(all_syms, datum_logp_expr)
+    lam_f_prior = lambdify(all_syms, prior_logp_expr)
+    pvalues = [] + list(data_values)
+    
+    def f(theta):
+        args = pvalues + list(theta)
+        ## NOTE we're normalizing such that the density is 1 at the mode of the distribution.
+        return np.exp(np.sum(lam_f_n(*args)) + lam_f_prior(*args) + map_optres.fun)
+
+    D = len(theta_bounds)
+    
+    def fx(x):
+        def h(*theta1):
+            theta = theta1[0:plotted_i] + (x,) + theta1[plotted_i: D - 1]
+            return f(theta)
+        return h
+    
+    theta1_bounds = theta_bounds[0:plotted_i] + theta_bounds[plotted_i + 1: D]
+    
+    def var_intgr_opts(i):
+        points = [(map_optres.x[i] + k*np.sqrt(cov[i,i])) for k in [-10, 0, 10]]
+        return {'points': points}
+    
+    intgr_opts = [var_intgr_opts(i) for i in range(D) if i != plotted_i]
+    
+    def g(x):
+        r, err = intgr.nquad(fx(x), theta1_bounds, opts=intgr_opts)
+        return r
+    
+    ys_intr = np.array([g(x) for x in xs])
+    ys_intr = ys_intr / np.sum(ys_intr)
+    plt.plot(
+            xs,
+            ys_intr,
+            '',
+            label="Numerical Integration")
+    ax = plt.gca()
+    ax.set_title('Posterior probability of {}'.format(str(theta_syms[plotted_i])))
+    ax.set_ylabel('Probability density')
+    ax.set_xlabel(str(theta_syms[plotted_i]))
+    plt.legend()
+    plt.show()
+
+def plot_posterior_m1(raw_data, var_idx):
+    mat = model1_design_matrix(raw_data)
+    t = mat[:,-1]
+    x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
+    
+    theta0 = [0.0, 0.1]
+    theta_bounds = (u_bounds, sigma_bounds)
+    
+    return plot_posterior(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], 
+              theta0, theta_bounds,
+              var_idx)
+
+    
+def plot_u_posterior_m1(raw_data):
+    return plot_posterior_m1(raw_data, 0)
+
+plot_u_posterior_m1(raw_training_data)
+
+
+def plot_posterior_m2(raw_data, var_idx):
+    feat_mat = model2_feature_matrix(raw_data)
+    
+    t = feat_mat[:,2]
+    phi = feat_mat[:,0]
+    psi = feat_mat[:,1]
+    
+    theta0 = (0.0, 0.0, 0.1)
+    theta_bounds = (u_bounds, v_bounds, sigma_bounds)
+    
+    return plot_posterior(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], 
+              [t, phi, psi], theta0, theta_bounds,
+              var_idx)
+
+def plot_u_posterior_m2(raw_data):
+    return plot_posterior_m2(raw_data, 0)
+    
+plot_u_posterior_m2(raw_training_data)
+
+def plot_v_posterior_m2(raw_data):
+    return plot_posterior_m2(raw_data, 1)
+    
+
+
+def plot_uv_posterior_m2(raw_data): ## FIXME
+    map_optres = find_model2_map(raw_data)
+    Z = scp_bayes.laplace_log_evidence(map_optres)
+    
+    cov_uv = linalg.inv(map_optres.hess)[0:2,0:2]
+    std_u, std_v = [np.sqrt(cov_uv[i,i]) for i in [0,1]]
     
     
+    
+    linalg.eig(cov_uv)
+    
+raw_data = raw_training_data
+    
+    
+plot_u_posterior_m2(raw_training_data)
+plot_v_posterior_m2(raw_training_data)
 
