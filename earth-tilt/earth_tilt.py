@@ -18,6 +18,10 @@ import numpy.linalg as linalg
 import datetime
 
 
+def in_degrees(angle_in_radians):
+  return angle_in_radians * 180 / np.pi
+
+
 #### Collecting data
 ## Let's generate random tuples of cities and dates
 ## This will yield a template to be filled manually
@@ -82,7 +86,7 @@ def write_data_template_to_file():
 #write_data_template_to_file()
 
 #### Generic functions across all models
-    
+
 raw_training_data = json.load(io.open("./data/day-durations-training.json"))
 raw_test_data = json.load(io.open("./data/day-durations-test.json"))
 
@@ -95,13 +99,13 @@ def parse_year_fraction(date_raw, lng):
     y,m,d = date_raw.split('-')
     return (datetime.datetime(int(y),int(m),int(d)).timestamp() - epoch_2019) / year_duration_s
 
-    
+
 def daylight_durations(raw_data):
     arr = []
     for m in raw_data:
         arr.append(parse_daylight_s(m['daylight']))
     return np.array(arr)
-        
+
 daylight_durations(raw_training_data)
 
 def rms_test_error(predicted_daylight_durations, actual_daylight_durations):
@@ -115,37 +119,38 @@ day_duration_s = 86400
 
 
 def model1_design_matrix(raw_data):
-    """
-    Processes the raw data into a matrix suitable for inferring model parameters via a linear regression.
-    The first 2 columns are basis functions, the last one is the target.
-    """
-    rows = []
-    for m in raw_data:
-        lat, lng = m['pos']
-        dl_s = parse_daylight_s(m['daylight'])
-        year_f = parse_year_fraction(m['date'], lng)
-        psi = year_f * (2 * np.pi)
-        tan_phi = np.tan(lat * np.pi / 180)
-        night_fraction = (1 - dl_s / day_duration_s)
-        target = np.cos(np.pi * night_fraction)
-        rows.append([
-          (tan_phi * np.cos(psi)),
-          (tan_phi * np.sin(psi)),
-          target
-          ])
-    return np.array(rows)
-        
+  """
+  Processes the raw data into a matrix suitable for inferring model parameters via a linear regression.
+  The first 2 columns are basis functions, the last one is the target.
+  """
+  rows = []
+  for m in raw_data:
+    lat, lng = m['pos']
+    dl_s = parse_daylight_s(m['daylight'])
+    year_f = parse_year_fraction(m['date'], lng)
+    psi = year_f * (2 * np.pi)
+    tan_phi = np.tan(lat * np.pi / 180)
+    night_fraction = (1 - dl_s / day_duration_s)
+    z = np.cos(np.pi * night_fraction) / tan_phi
+    target = z / np.sqrt(1 + z ** 2)  ## NOTE trigonometry says that this is what sin(arctan(z)) simplifies to.
+    rows.append([
+      np.cos(psi),
+      np.sin(psi),
+      tan_phi,  ## NOTE: this column is not useful for regression, but it will be useful for day length prediction.
+      target])
+  return np.array(rows)
+
 #mat = model1_design_matrix(raw_data)
 
 def model1_fit_alpha_and_sf(raw_data):
-    mat = model1_design_matrix(raw_data)
-    N = len(raw_data)
-    best_fit = linalg.lstsq(mat[:,0:-1], mat[:,-1], rcond=None)
-    A,B = best_fit[0]
-    alpha = np.arcsin((A**2 + B**2)**0.5)
-    solstice_fraction = np.arccos(A / np.sin(alpha)) / (2 * np.pi)
-    rmse = np.sqrt(best_fit[1][0] / N)
-    return (alpha, solstice_fraction, rmse, best_fit)
+  mat = model1_design_matrix(raw_data)
+  N = len(raw_data)
+  best_fit = linalg.lstsq(mat[:, 0:2], mat[:, -1], rcond=None)
+  A, B = best_fit[0]
+  alpha = np.arcsin((A ** 2 + B ** 2) ** 0.5)
+  solstice_fraction = np.arccos(A / np.sin(alpha)) / (2 * np.pi)
+  rmse = np.sqrt(best_fit[1][0] / N)
+  return (alpha, solstice_fraction, rmse, best_fit)
 
 m1_alpha, m1_sf, _, m1_lsqfit = model1_fit_alpha_and_sf(raw_training_data)
 
@@ -157,12 +162,14 @@ print('Inferred Earth tilt (alpha) and sostice date with linear regression: {:.2
 
 ## What's the prediction error?
 def model1_daylight_predictions(raw_data, alpha, solstice_fraction):
-    mat = model1_design_matrix(raw_data)
-    sf2pi = 2 * np.pi * solstice_fraction
-    p_cos_pi_nf = np.sin(alpha) * (np.cos(sf2pi ) * mat[:,0] + np.sin(sf2pi) * mat[:,1])
-    return day_duration_s * (1 - np.arccos(p_cos_pi_nf) / np.pi)
+  mat = model1_design_matrix(raw_data)
+  sf2pi = 2 * np.pi * solstice_fraction
+  p_cos_pi_nf = mat[:, 2] * np.tan(np.arcsin(np.sin(alpha) * (np.cos(sf2pi) * mat[:, 0] + np.sin(sf2pi) * mat[:, 1])))
+  return day_duration_s * (1 - np.arccos(p_cos_pi_nf) / np.pi)
 
-rms_test_error(model1_daylight_predictions(raw_test_data, m1_alpha, m1_sf), daylight_durations(raw_test_data)) ## 668.9611997734474 s, so about 11 minutes
+
+print("On test data, Model 1 achieves a Root Mean Squared prediction error of {:.1f} minutes.".format(
+  rms_test_error(model1_daylight_predictions(raw_test_data, m1_alpha, m1_sf), daylight_durations(raw_test_data)) / 60))
 
 ### Model 1 bis - let's say we know the date of the solstice, and only infer alpha
 june21_yf = parse_year_fraction("2019-06-21", 0)
@@ -182,7 +189,7 @@ m1_alpha_2, _rmse, _ = fit_alpha_at_solstice(raw_training_data)
 print('Inferred alpha with northern summer solstice at the correct date: {:.2f}'.format(m1_alpha_2 * 180 / np.pi)) ## 25.022396735018944°
 
 
-## Plotting 
+## Plotting
 real_tilt = 23.44 * np.pi / 180
 
 def plot_model1_bis_fit(raw_data, fit_alpha):
@@ -248,122 +255,193 @@ def plot_model1_rms(raw_data, fit_alpha, fit_soltice_yf):
     ax0.legend()
     plt.show()
 
-plot_model1_rms(raw_training_data, m1_alpha, m1_sf)  
+plot_model1_rms(raw_training_data, m1_alpha, m1_sf)
 
-#### Model 2: accounting for an excess angle eps
-## finding the global minimum with an optimization algorithm
+
 import scipy.optimize as opt
 import sympy as sy
 from sympy.utilities.lambdify import lambdify
 
-t_n, phi_n, psi_n, u, v = sy.symbols('t_n phi_n psi_n u v')
+y_n, phi_n, psi_n = sy.symbols('y_n phi_n psi_n') ## data
+u = sy.symbols('u') ## params
 
-p_n = (v / ((sy.cos(phi_n) * sy.sqrt(1 - (sy.cos(psi_n) * u)**2)))) + (u * sy.tan(phi_n) * sy.cos(psi_n))
-g_n = t_n - p_n
-e_n = (g_n ** 2) / 2
+m1b_p_n = sy.tan(phi_n) * sy.tan(sy.asin(u * sy.cos(psi_n))) ## the prediction
+m1b_e_n = (y_n - m1b_p_n) ** 2 ## squared error
+
+def model1b_feature_matrix(raw_data):
+  rows = []
+  for m in raw_data:
+    lat, lng = m['pos']
+    dl_s = parse_daylight_s(m['daylight'])
+    year_f = parse_year_fraction(m['date'], lng)
+    psi = (year_f - june21_yf) * (2 * np.pi)
+    phi = lat * np.pi / 180
+    night_fraction = (1 - dl_s / day_duration_s)
+    y = np.cos(np.pi * night_fraction)
+    rows.append([
+      phi,
+      psi,
+      y
+    ])
+  return np.array(rows)
+
+
+def model1b_fit_params(raw_data):
+  feat_mat = model1b_feature_matrix(raw_data)
+
+  y = feat_mat[:, 2]
+  phi = feat_mat[:, 0]
+  psi = feat_mat[:, 1]
+
+  e_n = m1b_e_n
+
+  lam_en = lambdify([y_n, phi_n, psi_n, u], e_n)
+
+  def squared_error(params):
+    u, = params
+    return np.average(lam_en(y, phi, psi, u))
+
+  lam_jac = lambdify([y_n, phi_n, psi_n, u], sy.diff(e_n, u))
+
+  def squared_err_jac(params):
+    u, = params
+    return np.array([np.average(lam_jac(y, phi, psi, u))])
+
+  lam_hess = lambdify([y_n, phi_n, psi_n, u], sy.diff(e_n, u, u))
+
+  def squared_err_hess(params):
+    u, = params
+    return np.array([[np.average(lam_hess(y, phi, psi, u))]])
+
+  def squared_err_hessp(params, p):
+    hess = np.matrix(squared_err_hess(params))
+    return np.matmul(hess, p)
+
+  opt_res = opt.minimize(
+    squared_error, (0.01),
+    bounds=((0, 1)),
+    method='trust-exact',
+    jac=squared_err_jac,
+    hess=squared_err_hess
+  )
+
+  return opt_res
+
+
+m1b_optres = model1b_fit_params(raw_training_data)
+m1b_u_opt, = m1b_optres.x
+m1b_alpha = np.arcsin(m1b_u_opt)
+print("Model 1b best-fit param is alpha = {:.2f}°, with an RMS error of {:.3f}".format(in_degrees(m1b_alpha), np.sqrt(m1b_optres.fun)))
+#model2_rmse = np.sqrt(model2_optres.fun * 2)
+
+
+#### Model 2: accounting for an excess angle eps
+## finding the global minimum with an optimization algorithm
+
+t_n, phi_n, psi_n, u, v = sy.symbols('t_n phi_n psi_n u v')
+m2_p_n = m1b_p_n + v / (sy.cos(phi_n) * sy.sqrt(1 - (u * sy.cos(psi_n))**2))
+m2_e_n = (y_n - m2_p_n) ** 2
 
 def model2_feature_matrix(raw_data):
-    rows = []
-    for m in raw_data:
-        lat, lng = m['pos']
-        dl_s = parse_daylight_s(m['daylight'])
-        year_f = parse_year_fraction(m['date'], lng)
-        psi = (year_f - june21_yf) * (2 * np.pi)
-        phi = lat * np.pi / 180
-        night_fraction = (1 - dl_s / day_duration_s)
-        t = np.cos(np.pi * night_fraction)
-        rows.append([
-          phi,
-          psi,
-          t
-          ])
-    return np.array(rows)
+    return model1b_feature_matrix(raw_data)
+
 
 def model2_fit_params(raw_data):
-    feat_mat = model2_feature_matrix(raw_data)
+  feat_mat = model2_feature_matrix(raw_data)
 
-    t = feat_mat[:,2]
-    phi = feat_mat[:,0]
-    psi = feat_mat[:,1]
-    
-    lam_en = lambdify([t_n, phi_n, psi_n, u, v], e_n)
-    def squared_error(u_v):
-        u, v = u_v
-        return np.average(lam_en(t, phi, psi, u, v))
+  y = feat_mat[:, 2]
+  phi = feat_mat[:, 0]
+  psi = feat_mat[:, 1]
 
-    jac_lambdas = [lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1)) for var1 in [u, v]]
-    def squared_err_jac(u_v):
-        u, v = u_v
-        return np.array([np.average(l(t, phi, psi, u, v)) for l in jac_lambdas])
+  e_n = m2_e_n
 
-    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(e_n, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]    
-    def squared_err_hess(u_v):
-        u, v = u_v
-        return np.array([[np.average(l(t, phi, psi, u, v)) for l in row] for row in hess_lambdas])
+  lam_en = lambdify([y_n, phi_n, psi_n, u, v], e_n)
 
-    def squared_err_hessp(u_v, p):
-        hess = np.matrix(squared_err_hess(u_v))
-        return np.matmul(hess, p)
+  def squared_error(params):
+    u, v = params
+    return np.average(lam_en(y, phi, psi, u, v))
 
-    opt_res = opt.minimize(
-        squared_error, (0.0, 0.0), 
-        bounds = ((0, 1), (0, 1)),
-        method='trust-exact', 
-        jac=squared_err_jac, 
-        hess=squared_err_hess
-        )
-    
-    return opt_res
-    
+  lam_jac_s = [lambdify([y_n, phi_n, psi_n, u, v], sy.diff(e_n, var1)) for var1 in [u, v]]
+
+  def squared_err_jac(params):
+    u, v = params
+    return np.array([np.average(l(y, phi, psi, u, v)) for l in lam_jac_s])
+
+  lam_hess_s = [[lambdify([y_n, phi_n, psi_n, u, v], sy.diff(e_n, var1, var2)) for var1 in [u, v]] for var2 in [u, v]]
+
+  def squared_err_hess(params):
+    u, v = params
+    return np.array([[np.average(l(y, phi, psi, u, v)) for l in row] for row in lam_hess_s])
+
+  def squared_err_hessp(params, p):
+    hess = np.matrix(squared_err_hess(params))
+    return np.matmul(hess, p)
+
+  opt_res = opt.minimize(
+    squared_error, (0.01, 0.01),
+    bounds=((0, 1), (0, 1)),
+    method='trust-exact',
+    jac=squared_err_jac,
+    hess=squared_err_hess
+  )
+
+  return opt_res
+
 model2_optres = model2_fit_params(raw_training_data)
-u_opt, v_opt = model2_optres.x
-print("Model 2 best-fit params are alpha = {:.2f}° and epsilon = {:.2f}°".format(np.arcsin(u_opt) * 180 / np.pi, np.arcsin(v_opt) * 180 / np.pi))
-model2_rmse = np.sqrt(model2_optres.fun * 2)
+m2_u_opt, m2_v_opt = model2_optres.x
+print("Model 2 best-fit params are alpha = {:.2f}° and epsilon = {:.2f}°".format(in_degrees(np.arcsin(m2_u_opt)), in_degrees(np.arcsin(m2_v_opt))))
+
 
 def plot_model2_rms(raw_data, model2_optres):
-    u_opt, v_opt = model2_optres.x
-    
-    us = np.linspace(0.2, 0.6, 1e2)
-    vs = np.linspace(0.0, 0.4, 1e2)
+  u_opt, v_opt = model2_optres.x
 
-    C2 = np.zeros((np.shape(vs)[0], np.shape(us)[0]))
-    for m in raw_data:
-        lat, lng = m['pos']
-        dl_s = parse_daylight_s(m['daylight'])
-        year_f = parse_year_fraction(m['date'], lng)
-        psi = 2 * np.pi * (year_f - june21_yf)
-        phi = lat * np.pi / 180
-        night_fraction = (1 - dl_s / day_duration_s)
-        t = np.cos(np.pi * night_fraction)
-        Rn = np.square(t - np.matmul(np.mat(vs).transpose(), np.mat((1 - (np.cos(psi) * us) ** 2) ** (-0.5) / np.cos(phi))) - np.tan(phi) * np.cos(psi) * np.matmul(np.mat(np.ones(len(vs))).transpose(), np.mat(us)))
-        C2 += Rn
-    C2 = (C2 / N) ** 0.5
+  us = np.linspace(0.2, 0.6, 1e2)
+  vs = np.linspace(0.0, 0.4, 1e2)
 
-    fig, (ax0) = plt.subplots(nrows=1)
-    im = ax0.contourf(us, vs, C2, 50)
-    fig.colorbar(im, ax=ax0)
-    ax0.set_title('Model 2 RMSE')
-    ax0.xaxis.set_label_text('u (a.k.a sin(alpha))')
-    ax0.yaxis.set_label_text('v (a.k.a sin(eps))')
-    ax0.plot([u_opt], [v_opt], marker='+', color='r', label="Best fit")
-    ax0.plot(np.full(len(vs), np.sin(real_tilt)), vs, color='w', linestyle='--', label="True alpha")
-    ax0.legend()
-    plt.show()
-    
+  C2 = np.zeros((np.shape(vs)[0], np.shape(us)[0]))
+  for m in raw_data:
+    lat, lng = m['pos']
+    dl_s = parse_daylight_s(m['daylight'])
+    year_f = parse_year_fraction(m['date'], lng)
+    psi = 2 * np.pi * (year_f - june21_yf)
+    phi = lat * np.pi / 180
+    night_fraction = (1 - dl_s / day_duration_s)
+    y = np.cos(np.pi * night_fraction)
+    Rn = np.square(
+      y - np.matmul(np.mat(vs).transpose(), np.mat((1 - (np.cos(psi) * us) ** 2) ** (-0.5) / np.cos(phi))) - np.tan(
+        phi) * np.tan(np.arcsin(np.cos(psi) * np.matmul(np.mat(np.ones(len(vs))).transpose(), np.mat(us)))))
+    C2 += Rn
+  C2 = (C2 / N) ** 0.5
+
+  fig, (ax0) = plt.subplots(nrows=1)
+  im = ax0.contourf(us, vs, C2, 50)
+  fig.colorbar(im, ax=ax0)
+  ax0.set_title('Model 2 RMSE')
+  ax0.xaxis.set_label_text('u (a.k.a sin(alpha))')
+  ax0.yaxis.set_label_text('v (a.k.a sin(eps))')
+  ax0.plot([u_opt], [v_opt], marker='+', color='r', label="Best fit")
+  ax0.plot(np.full(len(vs), np.sin(real_tilt)), vs, color='w', linestyle='--', label="True alpha")
+  ax0.legend()
+  plt.show()
+
+
 plot_model2_rms(raw_training_data, model2_optres)
 
-def model2_daylight_predictions(raw_data, u_opt, v_opt):
-    feat_mat = model2_feature_matrix(raw_data)
-    lam_pn = lambdify([phi_n, psi_n, u, v], p_n)
-    phi = feat_mat[:,0]
-    psi = feat_mat[:,1]
-    p_cos_pi_nf = lam_pn(phi, psi, u_opt, v_opt)
-    return day_duration_s * (1 - np.arccos(p_cos_pi_nf) / np.pi)
 
-    
-rms_test_error(model2_daylight_predictions(raw_test_data, u_opt, v_opt), daylight_durations(raw_test_data)) ## 234.5997870975872 s, so about 4 minutes
-    
-    
+def model2_daylight_predictions(raw_data, u_opt, v_opt):
+  feat_mat = model2_feature_matrix(raw_data)
+  lam_pn = lambdify([phi_n, psi_n, u, v], m2_p_n)
+  phi = feat_mat[:, 0]
+  psi = feat_mat[:, 1]
+  y = lam_pn(phi, psi, u_opt, v_opt)
+  return day_duration_s * (1 - np.arccos(y) / np.pi)
+
+
+print("On test data, Model 2 achieves a Root Mean Squared prediction error of {:.1f} minutes.".format(
+  rms_test_error(model2_daylight_predictions(raw_test_data, m2_u_opt, m2_v_opt),
+                 daylight_durations(raw_test_data)) / 60))
+
+
 #### Bayesian modeling
 
 ## Laplace approximation
@@ -384,7 +462,7 @@ def find_model1_map(raw_data):
     mat = model1_design_matrix(raw_data)
     t = mat[:,-1]
     x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
-    
+
     return scp_bayes.find_map(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], [0.0, 0.1], (u_bounds, sigma_bounds))
 
 m1_map = find_model1_map(raw_training_data)
@@ -402,14 +480,14 @@ lp2_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + np.log(1 / (v_bounds[1] - 
 
 def find_model2_map(raw_data):
     feat_mat = model2_feature_matrix(raw_data)
-    
+
     t = feat_mat[:,2]
     phi = feat_mat[:,0]
     psi = feat_mat[:,1]
-    
+
     theta0 = (0.0, 0.0, 0.1)
     theta_bounds = (u_bounds, v_bounds, sigma_bounds)
-    
+
     return scp_bayes.find_map(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], theta0, theta_bounds)
 
 m2_map = find_model2_map(raw_training_data)
@@ -429,24 +507,24 @@ def integrate_model1_logevidence(raw_data):
     mat = model1_design_matrix(raw_data)
     t = mat[:,-1]
     x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
-    
+
     theta0 = [0.0, 0.1]
     theta_bounds = (u_bounds, sigma_bounds)
-    
+
     return scp_bayes.integrate_evidence(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], theta0, theta_bounds)
-                
-m1_logev, m1_logev_err = integrate_model1_logevidence(raw_training_data)    
+
+m1_logev, m1_logev_err = integrate_model1_logevidence(raw_training_data)
 
 def integrate_model2_logevidence(raw_data):
     feat_mat = model2_feature_matrix(raw_data)
-    
+
     t = feat_mat[:,2]
     phi = feat_mat[:,0]
     psi = feat_mat[:,1]
-    
+
     theta0 = (0.0, 0.0, 0.1)
     theta_bounds = (u_bounds, v_bounds, sigma_bounds)
-    
+
     return scp_bayes.integrate_evidence(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], theta0, theta_bounds)
 
 #m2_logev, m2_logeverr = integrate_model2_logevidence(raw_training_data) ## NOTE slow to  compute (~ 1 minute)
@@ -459,7 +537,7 @@ def plot_posterior(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data
     """.
     """
     map_optres = scp_bayes.find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds)
-    
+
     cov = linalg.inv(map_optres.hess)
     std_dev = np.sqrt(cov[plotted_i,plotted_i])
     mode = map_optres.x[plotted_i]
@@ -473,37 +551,37 @@ def plot_posterior(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data
             ys_lpl,
             '',
             label="Laplace Approximation")
-    
+
     all_syms = [] + list(data_syms) + list(theta_syms)
     lam_f_n = lambdify(all_syms, datum_logp_expr)
     lam_f_prior = lambdify(all_syms, prior_logp_expr)
     pvalues = [] + list(data_values)
-    
+
     def f(theta):
         args = pvalues + list(theta)
         ## NOTE we're normalizing such that the density is 1 at the mode of the distribution.
         return np.exp(np.sum(lam_f_n(*args)) + lam_f_prior(*args) + map_optres.fun)
 
     D = len(theta_bounds)
-    
+
     def fx(x):
         def h(*theta1):
             theta = theta1[0:plotted_i] + (x,) + theta1[plotted_i: D - 1]
             return f(theta)
         return h
-    
+
     theta1_bounds = theta_bounds[0:plotted_i] + theta_bounds[plotted_i + 1: D]
-    
+
     def var_intgr_opts(i):
         points = [(map_optres.x[i] + k*np.sqrt(cov[i,i])) for k in [-10, 0, 10]]
         return {'points': points}
-    
+
     intgr_opts = [var_intgr_opts(i) for i in range(D) if i != plotted_i]
-    
+
     def g(x):
         r, err = intgr.nquad(fx(x), theta1_bounds, opts=intgr_opts)
         return r
-    
+
     ys_intr = np.array([g(x) for x in xs])
     ys_intr = ys_intr / np.sum(ys_intr)
     plt.plot(
@@ -522,15 +600,15 @@ def plot_posterior_m1(raw_data, var_idx):
     mat = model1_design_matrix(raw_data)
     t = mat[:,-1]
     x_1s = np.cos(psi_sf) * mat[:,0] + np.sin(psi_sf) * mat[:,1]
-    
+
     theta0 = [0.0, 0.1]
     theta_bounds = (u_bounds, sigma_bounds)
-    
-    return plot_posterior(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s], 
+
+    return plot_posterior(lp1_theta, lp1_n, [t_n, x_1], [u, sigma], [t, x_1s],
               theta0, theta_bounds,
               var_idx)
 
-    
+
 def plot_u_posterior_m1(raw_data):
     return plot_posterior_m1(raw_data, 0)
 
@@ -539,42 +617,42 @@ plot_u_posterior_m1(raw_training_data)
 
 def plot_posterior_m2(raw_data, var_idx):
     feat_mat = model2_feature_matrix(raw_data)
-    
+
     t = feat_mat[:,2]
     phi = feat_mat[:,0]
     psi = feat_mat[:,1]
-    
+
     theta0 = (0.0, 0.0, 0.1)
     theta_bounds = (u_bounds, v_bounds, sigma_bounds)
-    
-    return plot_posterior(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma], 
+
+    return plot_posterior(lp2_theta, lp2_n, [t_n, phi_n, psi_n], [u, v, sigma],
               [t, phi, psi], theta0, theta_bounds,
               var_idx)
 
 def plot_u_posterior_m2(raw_data):
     return plot_posterior_m2(raw_data, 0)
-    
+
 plot_u_posterior_m2(raw_training_data)
 
 def plot_v_posterior_m2(raw_data):
     return plot_posterior_m2(raw_data, 1)
-    
+
 
 
 def plot_uv_posterior_m2(raw_data): ## FIXME
     map_optres = find_model2_map(raw_data)
     Z = scp_bayes.laplace_log_evidence(map_optres)
-    
+
     cov_uv = linalg.inv(map_optres.hess)[0:2,0:2]
     std_u, std_v = [np.sqrt(cov_uv[i,i]) for i in [0,1]]
-    
-    
-    
+
+
+
     linalg.eig(cov_uv)
-    
+
 raw_data = raw_training_data
-    
-    
+
+
 plot_u_posterior_m2(raw_training_data)
 plot_v_posterior_m2(raw_training_data)
 
@@ -600,7 +678,7 @@ def model3_design_matrix(raw_data):
           target
           ])
     return np.array(rows)
-        
+
 #mat = model1_design_matrix(raw_data)
 
 def model3_fit_alpha_and_sf(raw_data):
@@ -633,14 +711,14 @@ lp3a_theta = np.log(1 / (A_bounds[1] - A_bounds[0])) + np.log(1 / (B_bounds[1] -
 
 def find_model3a_map(raw_data):
     mat = model3_design_matrix(raw_data)
-   
+
     t = mat[:, 2]
     x_1 = mat[:,0]
     x_2 = mat[:,1]
-    
+
     theta0 = (0.0, 0.0, 0.1)
     theta_bounds = (A_bounds, B_bounds, sigma_bounds)
-    
+
     return scp_bayes.find_map(lp3a_theta, lp3a_n, [t_n, x_1n, x_2n], [A, B, sigma], [t, x_1, x_2], theta0, theta_bounds)
 
 m3a_map = find_model3a_map(raw_training_data)
@@ -683,12 +761,12 @@ plot_model3_bis_fit(high_latitude_data, m3_alpha)
 def model3_daylight_predictions(raw_data, alpha, solstice_fraction):
     mat = model3_design_matrix(raw_data)
     phi = np.array([m['pos'][0] * np.pi / 180 for m in raw_data])
-    
+
     A = np.sin(alpha) * np.cos(2 * np.pi * solstice_fraction)
     B = np.sin(alpha) * np.sin(2 * np.pi * solstice_fraction)
     t = A * mat[:,0] + B * mat[:,1]
     z = np.arcsin(np.tan(t))
-    
+
     d_f = 1 - np.arccos(z * np.tan(phi)) / np.pi
     return day_duration_s * d_f
 
@@ -706,14 +784,14 @@ def model3b_design_matrix(raw_data):
         tan_phi = np.tan(lat * np.pi / 180)
         night_fraction = (1 - dl_s / day_duration_s)
         z = np.cos(np.pi * night_fraction)
-        
+
         rows.append([
           tan_phi * np.cos(psi),
           tan_phi * np.sin(psi),
           z
           ])
     return np.array(rows)
-        
+
 #mat = model1_design_matrix(raw_data)
 
 A, B = sy.symbols('A B')
@@ -729,7 +807,7 @@ def model3b_fit_params(raw_data):
     z = feat_mat[:,2]
     x_1 = feat_mat[:,0]
     x_2 = feat_mat[:,1]
-    
+
     lam_en = lambdify([z_n, x_1n, x_2n, A, B], m3_en)
     def squared_error(params):
         A, B = params
@@ -740,7 +818,7 @@ def model3b_fit_params(raw_data):
         A, B = params
         return np.array([np.average(l(z, x_1, x_2, A, B)) for l in jac_lambdas])
 
-    hess_lambdas = [[lambdify([z_n, x_1n, x_2n, A, B], sy.diff(m3_en, var1, var2)) for var2 in [A, B]] for var1 in [A, B]]    
+    hess_lambdas = [[lambdify([z_n, x_1n, x_2n, A, B], sy.diff(m3_en, var1, var2)) for var2 in [A, B]] for var1 in [A, B]]
     def squared_err_hess(params):
         A, B = params
         return np.array([[np.average(l(z, x_1, x_2, A, B)) for l in row] for row in hess_lambdas])
@@ -750,13 +828,13 @@ def model3b_fit_params(raw_data):
         return np.matmul(hess, p)
 
     opt_res = opt.minimize(
-        squared_error, (0.2, 0.3), 
+        squared_error, (0.2, 0.3),
         bounds = ((-1, 1), (-1, 1)),
-        method='trust-exact', 
-        jac=squared_err_jac, 
+        method='trust-exact',
+        jac=squared_err_jac,
         hess=squared_err_hess
         )
-    
+
     return opt_res
 
 def model3b_fit_alpha_and_sf(raw_data):
@@ -789,7 +867,7 @@ def model3c_design_matrix(raw_data):
         psi = (year_f - june21_yf) * (2 * np.pi)
         phi = lat * np.pi / 180
         night_fraction = (1 - dl_s / day_duration_s)
-        t = np.cos(np.pi * night_fraction)     
+        t = np.cos(np.pi * night_fraction)
         rows.append([
           phi,
           psi,
@@ -803,7 +881,7 @@ def model3c_fit_params(raw_data):
     t = feat_mat[:,2]
     phi = feat_mat[:,0]
     psi = feat_mat[:,1]
-    
+
     lam_en = lambdify([t_n, phi_n, psi_n, u], m3c_en)
     def squared_error(params):
         u, = params
@@ -814,7 +892,7 @@ def model3c_fit_params(raw_data):
         u, = params
         return np.array([np.average(l(t, phi, psi, u)) for l in jac_lambdas])
 
-    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u], sy.diff(m3c_en, var1, var2)) for var2 in [u]] for var1 in [u]]    
+    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u], sy.diff(m3c_en, var1, var2)) for var2 in [u]] for var1 in [u]]
     def squared_err_hess(params):
         u, = params
         return np.array([[np.average(l(t, phi, psi, u)) for l in row] for row in hess_lambdas])
@@ -824,13 +902,13 @@ def model3c_fit_params(raw_data):
         return np.matmul(hess, p)
 
     opt_res = opt.minimize(
-        squared_error, (0.2), 
+        squared_error, (0.2),
         bounds = ((0, 1)),
-        method='trust-exact', 
-        jac=squared_err_jac, 
+        method='trust-exact',
+        jac=squared_err_jac,
         hess=squared_err_hess
         )
-    
+
     return opt_res
 
 m3c_optres = model3c_fit_params(raw_training_data)
@@ -840,13 +918,13 @@ m3c_rmse = np.sqrt(m3c_optres.fun)
 
 def model3c_daylight_predictions(raw_data, m4_u):
     mat = model4_design_matrix(raw_data)
-   
+
     phi = mat[:,0]
     psi = mat[:,1]
-    
+
     lam_pn = lambdify([phi_n, psi_n, u], m3c_pn)
     z = lam_pn(phi, psi, m4_u)
-    
+
     d_f = 1 - np.arccos(z) / np.pi
     return day_duration_s * d_f
 
@@ -857,14 +935,14 @@ lp3c_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + sy.ln(1 / sigma) - np.log
 
 def find_model3c_map(raw_data):
     mat = model3c_design_matrix(raw_data)
-   
+
     t = mat[:, 2]
     phi = mat[:,0]
     psi = mat[:,1]
-    
+
     theta0 = (0.0, 0.1)
     theta_bounds = (u_bounds, sigma_bounds)
-    
+
     return scp_bayes.find_map(lp3c_theta, lp3c_n, [t_n, phi_n, psi_n], [u, sigma], [t, phi, psi], theta0, theta_bounds)
 
 m3c_map = find_model3c_map(raw_training_data)
@@ -884,7 +962,7 @@ def model4_design_matrix(raw_data):
         psi = (year_f - june21_yf) * (2 * np.pi)
         phi = lat * np.pi / 180
         night_fraction = (1 - dl_s / day_duration_s)
-        t = np.cos(np.pi * night_fraction)     
+        t = np.cos(np.pi * night_fraction)
         rows.append([
           phi,
           psi,
@@ -898,7 +976,7 @@ def model4_fit_params(raw_data):
     t = feat_mat[:,2]
     phi = feat_mat[:,0]
     psi = feat_mat[:,1]
-    
+
     lam_en = lambdify([t_n, phi_n, psi_n, u, v], m4_en)
     def squared_error(params):
         u, v = params
@@ -909,7 +987,7 @@ def model4_fit_params(raw_data):
         u, v = params
         return np.array([np.average(l(t, phi, psi, u, v)) for l in jac_lambdas])
 
-    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(m4_en, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]    
+    hess_lambdas = [[lambdify([t_n, phi_n, psi_n, u, v], sy.diff(m4_en, var1, var2)) for var2 in [u, v]] for var1 in [u, v]]
     def squared_err_hess(params):
         u, v = params
         return np.array([[np.average(l(t, phi, psi, u, v)) for l in row] for row in hess_lambdas])
@@ -919,13 +997,13 @@ def model4_fit_params(raw_data):
         return np.matmul(hess, p)
 
     opt_res = opt.minimize(
-        squared_error, (0.2, 0.3), 
+        squared_error, (0.2, 0.3),
         bounds = ((0, 1), (0, 1)),
-        method='trust-exact', 
-        jac=squared_err_jac, 
+        method='trust-exact',
+        jac=squared_err_jac,
         hess=squared_err_hess
         )
-    
+
     return opt_res
 
 m4_optres = model4_fit_params(raw_training_data)
@@ -938,13 +1016,13 @@ m4_rmse = np.sqrt(m4_optres.fun)
 
 def model4_daylight_predictions(raw_data, m4_u, m4_v):
     mat = model4_design_matrix(raw_data)
-   
+
     phi = mat[:,0]
     psi = mat[:,1]
-    
+
     lam_pn = lambdify([phi_n, psi_n, u, v], m4_pn)
     z = lam_pn(phi, psi, m4_u, m4_v)
-    
+
     d_f = 1 - np.arccos(z) / np.pi
     return day_duration_s * d_f
 
@@ -955,14 +1033,14 @@ lp4_theta = np.log(1 / (u_bounds[1] - u_bounds[0])) + np.log(1 / (v_bounds[1] - 
 
 def find_model4_map(raw_data):
     mat = model4_design_matrix(raw_data)
-   
+
     t = mat[:, 2]
     phi = mat[:,0]
     psi = mat[:,1]
-    
+
     theta0 = (0.0, 0.0, 0.1)
     theta_bounds = (u_bounds, v_bounds, sigma_bounds)
-    
+
     return scp_bayes.find_map(lp4_theta, lp4_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], theta0, theta_bounds)
 
 m4_map = find_model4_map(raw_training_data)
@@ -972,15 +1050,15 @@ m4_eps_99 = [np.arcsin(v) * 180 / np.pi for v in scp_bayes.laplace_99_confidence
 
 def plot_posterior_m4(raw_data, var_idx):
     mat = model4_design_matrix(raw_data)
-   
+
     t = mat[:, 2]
     phi = mat[:,0]
     psi = mat[:,1]
-    
+
     theta0 = [0.0, 0.0, 0.1]
     theta_bounds = (u_bounds, v_bounds, sigma_bounds)
-    
-    return plot_posterior(lp4_theta, lp4_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi], 
+
+    return plot_posterior(lp4_theta, lp4_n, [t_n, phi_n, psi_n], [u, v, sigma], [t, phi, psi],
               theta0, theta_bounds,
               var_idx)
 

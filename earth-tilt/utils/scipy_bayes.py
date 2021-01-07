@@ -8,6 +8,7 @@ Created on Tue Nov 26 21:22:42 2019
 
 import numpy as np
 import scipy.optimize as opt
+import scipy.special
 import sympy as sy
 from sympy.utilities.lambdify import lambdify
 import numpy.linalg as np_linalg
@@ -17,7 +18,7 @@ import scipy.integrate as intgr
 def find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds):
     """
     Generic function for finding Maximum A Posteriori (MAP) approximations to posterior distributions, based on a symbolicly-expressed probability model for the data and parameters along with observed data.
-    
+
     Given:
     - prior_logp_expr: a SymPy expression of the prior log-probabiliy density of the distribution parameters
     - datum_logp_expr: a SymPy expression of the log-probabiliy density of a data point given the parameters
@@ -26,27 +27,27 @@ def find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_value
     - data_values: the list of values corresponding to data_syms (some of which are expected to be NumPy arrays)
     - theta0: the starting value to search for the MAP parameters
     - theta_bounds: bounds for the allowed data parameters, as accepted by scipy.optimize.minimize
-    
+
     Returns the scipy.optimize.minimize optimization result object, corresponding to minimizing the negated posterior log-probability of the parameters (in other words, minimizing the information content of the distribution parameters given the data).
-    
+
     The supplied symbolic expressions are used to compute the gradient and Hessian of the posterior log-probability of parameters, which are leveraged by scipy.optimize to maximize it.
-    
+
     In particular, this minimization result contains a MAP parameters point and its Hessian, which allows for applying the Laplace Approximation to the posterior distribution.
     """
-    
+
     all_syms = [list(data_syms), list(theta_syms)]
     lam_f_n = lambdify(all_syms, datum_logp_expr)
     lam_f_prior = lambdify(all_syms, prior_logp_expr)
     pvalues = [] + list(data_values)
-    
+
     def f(theta):
-        return - (np.sum(lam_f_n(pvalues, theta)) + 
+        return - (np.sum(lam_f_n(pvalues, theta)) +
                   lam_f_prior(pvalues, theta))
 
     jac_n = [lambdify(all_syms, sy.diff(datum_logp_expr, var1)) for var1 in theta_syms]
     jac_prior = [lambdify(all_syms, sy.diff(prior_logp_expr, var1)) for var1 in theta_syms]
     def jac(theta):
-        return - (np.array([np.sum(l(pvalues, theta)) for l in jac_n]) + 
+        return - (np.array([np.sum(l(pvalues, theta)) for l in jac_n]) +
                   np.array([l(pvalues, theta) for l in jac_prior]))
 
     hess_n = [[lambdify(all_syms, sy.diff(datum_logp_expr, var1, var2)) for var2 in theta_syms] for var1 in theta_syms]
@@ -63,53 +64,98 @@ def find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_value
     opt_res = opt.minimize(
         f, theta0,
         bounds = theta_bounds,
-        method='trust-exact', 
-        jac=jac, 
+        method='trust-exact',
+        jac=jac,
         hess=hess
         )
     return opt_res
 
+
 def laplace_log_evidence(map_optres):
     """
     Using the Laplace Approximation, computes the log of the Model Evidence.
-    
+
     `map_optres` should be the value returned by `find_map`.
     """
     precision = map_optres.hess
     logprob_map = 0.5 * np.log(np_linalg.det(precision / (2 * np.pi)))
     return - map_optres.fun - logprob_map  #np.exp(logprob_map + map_optres.fun)
 
-def laplace_99_confidence_interval(map_optres, var_i):
+
+def laplace_posterior_logp_expr(params_syms, map_optres):
+    """
+    Using the Laplace Method, computes an expression of a Gaussian approximation of the posterior-probability.
+
+    `map_optres` should be the value returned by `find_map`;
+    `params_syms` must be the positionally-corresponding SymPy symbols.
+
+    Returns a SymPy expression for the posterior log-probability of the parameters,
+    which by construction will be a definite-negative quadratic form.
+    """
+    mean = map_optres.x
+    precision = map_optres.hess
+    lp = 0
+    d = len(params_syms)
+    for i in range(d):
+      for j in range(d):
+        lp = (params_syms[i] - mean[i]) * precision[i, j] * (params_syms[j] - mean[j]) + lp
+    lp = lp.simplify()
+    ret = 0.5 * (np.log(np_linalg.det(precision / (2 * np.pi))) - lp)
+    return ret
+
+
+
+def laplace_posterior_expr(syms, map_optres):
+    return sy.exp(laplace_posterior_logp_expr(syms, map_optres))
+
+
+def gaussian_HDI(intvl_prob, m, std):
+    x = scipy.special.erfinv(intvl_prob)
+    w = np.sqrt(2) * std * x
+    return (m - w , m + w)
+
+
+def _test_gaussian_HDI():
+    assert gaussian_HDI(0.6827, 0, 1) == (-1.0000217133229992, 1.0000217133229992)
+    assert gaussian_HDI(0.9545, 0, 1) == (-2.0000024438996027, 2.0000024438996027)
+    assert gaussian_HDI(0.9973, 0, 1) == (-2.9999769927034015, 2.9999769927034015)
+
+
+def laplace_HDI(intvl_prob, map_optres, var_i):
     mean = map_optres.x[var_i]
     cov = np_linalg.inv(map_optres.hess)
-    std = cov[var_i,var_i]**0.5
-    return (mean - 3 * std, mean + 3*std)
+    std = cov[var_i, var_i] ** 0.5
+    return gaussian_HDI(intvl_prob, mean, std)
+
+
+def laplace_99_confidence_interval(map_optres, var_i):
+    return laplace_HDI(0.99, map_optres, var_i)
 
 
 def integrate_evidence(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds):
     """
     Generic function for computing Model Evidence by numerical integration of the posterior distribution, based on a symbolicly-expressed probability model for the data and parameters along with observed data.
-    
+
     Returns an (logev, logerr) tuple, where logev is the natural logarithm of the computed Model Evidence, and logerr the natural logarithm of the absolute error bound in the integration.
-    
+
     Implementation note: calls `find_map` in order to find the mode and characteristic lengthscales of the posterior distribution,
     so as to assist the integration algorithm by highlighting the small high-density region around the mode.
     """
     std_dev_multiples = [-10, 0, 10]
-    
+
     map_optres = find_map(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, data_values, theta0, theta_bounds)
 
     all_syms = [list(data_syms), list(theta_syms)]
     lam_f_n = lambdify(all_syms, datum_logp_expr)
     lam_f_prior = lambdify(all_syms, prior_logp_expr)
     pvalues = [] + list(data_values)
-    
+
     def f(*theta):
         ## NOTE we're normalizing such that the density is 1 at the mode of the distribution.
         return np.exp(np.sum(lam_f_n(pvalues, theta)) + lam_f_prior(pvalues, theta) + map_optres.fun)
-        
+
     cov = np_linalg.inv(map_optres.hess)
-        
+
     def intgr_points(i_var):
         low, high = theta_bounds[i_var]
         mode = map_optres.x[i_var]
@@ -120,12 +166,12 @@ def integrate_evidence(prior_logp_expr, datum_logp_expr, data_syms, theta_syms, 
             if(low < p < high):
                 ret += [p]
         return ret
-    
+
     v, err = intgr.nquad(f, theta_bounds,
         ## NOTE we're marking the region surrounding the mode as requiring extra attention from the integration algorithm,
         ## as the distribution will be extremely peaked around it;
         ## we use the Hessian to find the characteristic variation lengths around that mode.
         opts=[{'points': intgr_points(i_var)} for i_var in range(len(theta_syms))])
-    
+
     return (np.log(v) - map_optres.fun, np.log(err) - map_optres.fun)
-    
+
